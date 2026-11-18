@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">黄梅戏</string>
+    <string name="call_service_desc">家人打微信视频来时自动接听，挂断后回到黄梅戏。</string>
+    <string name="call_service_label">黄梅戏·微信自动接听</string>
+</resources>
