@@ -77,8 +77,20 @@ object CallGuard {
      */
     fun ringing(): Boolean {
         val c = incoming ?: return false
-        return SystemClock.elapsedRealtime() - c.at < 60_000
+        return SystemClock.elapsedRealtime() - c.at < RING_MS
     }
+
+    /** 来电响铃最多算 60 秒。 */
+    const val RING_MS = 60_000L
+
+    /**
+     * 新来的来电通知是不是"同一通还在响的来电"的更新。
+     * 微信每次来电都用同一个通知 id，key 永远一样，所以只比 key 会把新来电当成旧的而忽略
+     * （旧来电没被清掉时——比如对方没等接通就挂了——新来电就再也不会被接）。
+     * 只有旧记录还在响、通知也没撤时才算同一通。
+     */
+    fun isSameRingingCall(cur: Incoming?, key: String, now: Long): Boolean =
+        cur != null && cur.key == key && !cur.removed && now - cur.at < RING_MS
 
     fun voipOnTop(): Boolean = lastWeChatClass.contains("voip", ignoreCase = true)
 
@@ -88,6 +100,14 @@ object CallGuard {
 
     fun locked(ctx: Context): Boolean =
         ctx.getSystemService(ActivityManager::class.java).lockTaskModeState != ActivityManager.LOCK_TASK_MODE_NONE
+
+    /**
+     * 微信的"[视频通话]/[语音通话]"消息通知：一通没接上的来电留下的记录，出现就说明这通已经结束（对方挂断或超时）。
+     * 正文可能是"[视频通话]"，也可能是"[2条]某某: [视频通话]"。
+     */
+    fun isCallRecord(title: String, text: String, callerName: String): Boolean =
+        (text.contains("[视频通话]") || text.contains("[语音通话]")) &&
+            (title == callerName || text.contains(callerName))
 
     /** 来电通知正文"某某邀请你视频通话" → 来电人；不是来电返回 null。 */
     fun parseInvite(text: String): Pair<String, Boolean>? {
@@ -160,7 +180,7 @@ object CallGuard {
         }.onFailure { Log.w(TAG, "重新打开服务失败", it) }
     }
 
-    private val main = Handler(Looper.getMainLooper())
+    private val main by lazy { Handler(Looper.getMainLooper()) }
     private var reviveApp: Context? = null
     private val reviveCheck = Runnable {
         val app = reviveApp ?: return@Runnable
@@ -199,11 +219,14 @@ class CallAnswerService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
 
-    private var answeringKey: String? = null
+    /** 正在处理的来电（按收到通知的时间区分；微信每次来电通知 key 都一样，不能用 key）。 */
+    private var answeringAt = -1L
     private var attempts = 0
     private var opened = 0
     private var lastAttemptAt = 0L
     private var shotBusy = false
+    /** 微信在最前面，但上次截图里没有接听按钮（停在微信首页等）：下一步去打开来电界面。 */
+    private var noButtonSeen = false
     private var wasInCall = false
     private var lastCallActiveAt = 0L
     private var lastLog = ""
@@ -251,13 +274,19 @@ class CallAnswerService : AccessibilityService() {
         if (!::prefs.isInitialized || !prefs.autoAnswer) return
         val now = SystemClock.elapsedRealtime()
         val inCall = CallGuard.audioInCall(this)
+        // 响过 60 秒还没接通的旧来电记录清掉，免得挡住下一通
+        if (CallGuard.incoming != null && !CallGuard.ringing() && !inCall) {
+            Log.i(tag, "来电记录超时，清掉")
+            CallGuard.incoming = null
+        }
         val call = CallGuard.incoming?.takeIf { CallGuard.ringing() }
 
         if (call != null && !inCall) {
-            if (answeringKey != call.key) {
-                answeringKey = call.key
+            if (answeringAt != call.at) {
+                answeringAt = call.at
                 attempts = 0
                 opened = 0
+                noButtonSeen = false
                 Log.i(tag, "来电：${call.name}（${if (call.video) "视频" else "语音"}）")
             }
             val onTop = wechatOnTop()
@@ -266,7 +295,14 @@ class CallAnswerService : AccessibilityService() {
                 Log.i(tag, "来电结束（对方取消）")
                 CallGuard.incoming = null
             } else if (shouldAnswer(call) && now - call.at >= prefs.answerDelayMs && now - lastAttemptAt > 2_500) {
-                if (onTop) {
+                if (onTop && noButtonSeen && opened < 3 && call.pi != null) {
+                    // 微信在前面，但截图里没有接听按钮（比如停在微信首页）：打开来电界面
+                    noButtonSeen = false
+                    opened++
+                    lastAttemptAt = now
+                    Log.i(tag, "微信在前面但没看到来电界面，打开它")
+                    CallGuard.openCallScreen(this, call.pi)
+                } else if (onTop) {
                     // 微信在最前面：截屏找绿色接听按钮（找不到就不点，所以不会误点别的界面）
                     if (attempts < 6) {
                         attempts++
@@ -342,6 +378,12 @@ class CallAnswerService : AccessibilityService() {
                 bmp.recycle()
                 if (spot == null) {
                     Log.w(tag, "第 $attempt 次：截图里没找到绿色接听按钮（${w}x$h）")
+                    noButtonSeen = true
+                    return
+                }
+                // 截屏到点击之间对方可能已经挂了（来电界面正在关）：点之前再确认一次还在响
+                if (CallGuard.incoming?.at != answeringAt || CallGuard.audioInCall(this@CallAnswerService)) {
+                    Log.i(tag, "第 $attempt 次：来电已经结束或已接通，不点了")
                     return
                 }
                 Log.i(tag, "第 $attempt 次点接听：(${spot.first}, ${spot.second})")
@@ -433,8 +475,16 @@ class CallNotificationListener : NotificationListenerService() {
         val title = n.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
         val text = n.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
         Log.d(tag, "微信通知 title=$title text=$text category=${n.category} fsi=${n.fullScreenIntent != null}")
+        // 收到这通来电的"[视频通话]"记录：对方挂断了（或超时没接），马上结束，免得微信一直停在前面、挡住下一通
+        val cur = CallGuard.incoming
+        if (cur != null && !CallGuard.audioInCall(this) && CallGuard.isCallRecord(title, text, cur.name)) {
+            Log.i(tag, "收到未接通话记录，来电结束（${cur.name} 挂断了）")
+            CallGuard.incoming = null
+            return
+        }
         val invite = CallGuard.parseInvite(text) ?: return
-        if (CallGuard.incoming?.key == sbn.key) return
+        // 同一通来电的通知更新就不重复记；key 一样但旧的已经不在响，说明是新的一通
+        if (CallGuard.isSameRingingCall(CallGuard.incoming, sbn.key, SystemClock.elapsedRealtime())) return
         CallGuard.incoming = CallGuard.Incoming(
             key = sbn.key,
             name = invite.first,

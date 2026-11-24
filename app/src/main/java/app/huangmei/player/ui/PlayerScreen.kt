@@ -3,6 +3,8 @@ package app.huangmei.player.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,27 +29,61 @@ import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import android.os.SystemClock
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import app.huangmei.player.AppViewModel
+import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
+
+/** 放起来这么久没人碰，就藏起底部的信息和按钮，画面全屏。 */
+private const val HIDE_CONTROLS_MS = 5_000L
 
 @Composable
 fun PlayerScreen(vm: AppViewModel) {
     BackHandler { vm.goHome() }
 
-    Column(Modifier.fillMaxSize().background(Color.Black)) {
+    // 5 秒没操作 → 全屏；点一下屏幕 → 按钮回来，再过 5 秒没操作又藏起来。暂停时一直显示。
+    var touchedAt by remember { mutableLongStateOf(0L) }
+    var controlsVisible by remember { mutableStateOf(true) }
+    LaunchedEffect(touchedAt, vm.paused, vm.current?.path, vm.interactions) {
+        controlsVisible = true
+        if (!vm.paused) {
+            delay(HIDE_CONTROLS_MS)
+            controlsVisible = false
+        }
+    }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .pointerInput(Unit) {
+                // 只记"有人碰了"，不拦截：按钮照常能点；按钮藏着时这一下只负责把按钮叫出来
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    touchedAt = SystemClock.uptimeMillis()
+                }
+            },
+    ) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
             VlcVideo(vm, Modifier.fillMaxSize())
 
@@ -80,27 +116,30 @@ fun PlayerScreen(vm: AppViewModel) {
             }
         }
 
-        InfoBar(vm)
+        // 不做滑动动画：画面尺寸只变一次，VLC 只需重新缩放一次
+        if (controlsVisible) {
+            InfoBar(vm)
 
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .height(104.dp)
-                .background(Palette.Bg)
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            ControlButton(Icons.Filled.GridView, "回海报", onClick = { vm.goHome() })
-            ControlButton(Icons.Filled.SkipPrevious, "上一部", onClick = { vm.skip(-1) })
-            ControlButton(
-                if (vm.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
-                if (vm.paused) "播放" else "暂停",
-                onClick = { vm.togglePause() },
-                primary = true,
-            )
-            ControlButton(Icons.Filled.SkipNext, "下一部", onClick = { vm.skip(1) })
-            ControlButton(Icons.AutoMirrored.Filled.VolumeDown, "小声", onClick = { vm.changeVolume(false) })
-            ControlButton(Icons.AutoMirrored.Filled.VolumeUp, "大声", onClick = { vm.changeVolume(true) })
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .height(104.dp)
+                    .background(Palette.Bg)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                ControlButton(Icons.Filled.GridView, "回海报", onClick = { vm.goHome() })
+                ControlButton(Icons.Filled.SkipPrevious, "上一部", onClick = { vm.skip(-1) })
+                ControlButton(
+                    if (vm.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                    if (vm.paused) "播放" else "暂停",
+                    onClick = { vm.togglePause() },
+                    primary = true,
+                )
+                ControlButton(Icons.Filled.SkipNext, "下一部", onClick = { vm.skip(1) })
+                ControlButton(Icons.AutoMirrored.Filled.VolumeDown, "小声", onClick = { vm.changeVolume(false) })
+                ControlButton(Icons.AutoMirrored.Filled.VolumeUp, "大声", onClick = { vm.changeVolume(true) })
+            }
         }
     }
 }
