@@ -79,6 +79,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var volumeShown by mutableStateOf(false); private set
     var volumeLevel by mutableFloatStateOf(0f); private set
 
+    /** 遥控器按键次数：播放界面据此把隐藏的按钮重新显示出来。 */
+    var interactions by mutableIntStateOf(0); private set
+
     private var playlist: List<Video> = emptyList()
     private var index = -1
     private var visible = false
@@ -479,6 +482,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun onRemoteKey(code: Int) {
         if (showAdmin || !hasStorageAccess) return
+        interactions++
         when (screen) {
             Screen.Player -> when (code) {
                 KeyEvent.KEYCODE_MEDIA_NEXT, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_PAGE_DOWN -> skip(1)
